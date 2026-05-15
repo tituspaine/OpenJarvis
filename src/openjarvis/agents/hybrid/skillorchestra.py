@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from openjarvis.agents._stubs import AgentContext
 from openjarvis.agents.hybrid._base import LocalCloudAgent
 from openjarvis.agents.hybrid._prices import NO_TEMP_PREFIXES, supports_temperature
+from openjarvis.agents.hybrid.mini_swe_agent import run_swe_agent_loop
 from openjarvis.core.registry import AgentRegistry
 
 
@@ -272,31 +273,71 @@ class SkillOrchestraAgent(LocalCloudAgent):
         run_cost = self.cost_usd(self._cloud_model, r_in, r_out)
 
         # 2. Execute via chosen agent
+        task_meta = (context.metadata.get("task") if context is not None else {}) or {}
+        swe_mode = (
+            bool(cfg.get("swe_use_agent_loop"))
+            and bool(task_meta.get("problem_statement"))
+            and bool(task_meta.get("repo"))
+            and bool(task_meta.get("base_commit"))
+        )
         if chosen == "local-qwen-27b":
             if not (self._local_model and self._local_endpoint):
                 raise ValueError(
                     "SkillOrchestra route hit local agent but local_model/"
                     f"local_endpoint missing: {self._local_model!r}/{self._local_endpoint!r}"
                 )
-            ans, w_in, w_out = self._call_vllm(
-                self._local_model,
-                self._local_endpoint,
-                user=question,
-                max_tokens=int(cfg.get("local_max_tokens", 4096)),
-                temperature=float(cfg.get("local_temperature", 0.2)),
-                enable_thinking=False,
-            )
-            tokens_local += w_in + w_out
+            if swe_mode:
+                out = run_swe_agent_loop(
+                    task_meta,
+                    backbone="local",
+                    backbone_model=self._local_model,
+                    local_endpoint=self._local_endpoint,
+                    initial_prompt=question,
+                    max_turns=int(cfg.get("swe_max_turns", 30)),
+                    bash_timeout=int(cfg.get("swe_bash_timeout_s", 120)),
+                    output_cap=int(cfg.get("swe_output_cap", 10_000)),
+                    turn_max_tokens=int(cfg.get("swe_turn_max_tokens", 4096)),
+                    trace_prefix="skillorch_local",
+                )
+                ans = out["answer"]
+                tokens_local += out["tokens_in"] + out["tokens_out"]
+            else:
+                ans, w_in, w_out = self._call_vllm(
+                    self._local_model,
+                    self._local_endpoint,
+                    user=question,
+                    max_tokens=int(cfg.get("local_max_tokens", 4096)),
+                    temperature=float(cfg.get("local_temperature", 0.2)),
+                    enable_thinking=False,
+                )
+                tokens_local += w_in + w_out
             worker_model = self._local_model
         else:
-            ans, w_in, w_out, _ = self._call_anthropic(
-                self._cloud_model,
-                user=question,
-                max_tokens=int(cfg.get("cloud_max_tokens", 4096)),
-                temperature=0.0,
-            )
-            tokens_cloud += w_in + w_out
-            run_cost += self.cost_usd(self._cloud_model, w_in, w_out)
+            if swe_mode:
+                out = run_swe_agent_loop(
+                    task_meta,
+                    backbone="cloud",
+                    backbone_model=self._cloud_model,
+                    cloud_endpoint=self._cloud_endpoint,
+                    initial_prompt=question,
+                    max_turns=int(cfg.get("swe_max_turns", 30)),
+                    bash_timeout=int(cfg.get("swe_bash_timeout_s", 120)),
+                    output_cap=int(cfg.get("swe_output_cap", 10_000)),
+                    turn_max_tokens=int(cfg.get("swe_turn_max_tokens", 4096)),
+                    trace_prefix="skillorch_cloud",
+                )
+                ans = out["answer"]
+                tokens_cloud += out["tokens_in"] + out["tokens_out"]
+                run_cost += out["cost_usd"]
+            else:
+                ans, w_in, w_out, _ = self._call_anthropic(
+                    self._cloud_model,
+                    user=question,
+                    max_tokens=int(cfg.get("cloud_max_tokens", 4096)),
+                    temperature=0.0,
+                )
+                tokens_cloud += w_in + w_out
+                run_cost += self.cost_usd(self._cloud_model, w_in, w_out)
             worker_model = self._cloud_model
 
         meta = {

@@ -35,11 +35,20 @@ import re
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
+import shutil
+import tempfile
+from pathlib import Path
+
 from openjarvis.agents._stubs import AgentContext
 from openjarvis.agents.hybrid._base import LocalCloudAgent
 from openjarvis.agents.hybrid._prices import (
     is_gpt5_family,
     supports_temperature,
+)
+from openjarvis.agents.hybrid.mini_swe_agent import (
+    _clone_repo,
+    _extract_diff,
+    run_swe_agent_loop,
 )
 from openjarvis.core.registry import AgentRegistry
 
@@ -281,6 +290,49 @@ def _call_worker(
     raise ValueError(f"unsupported worker endpoint: {ep!r}")
 
 
+def _swe_worker_step(
+    worker: Dict[str, Any],
+    task: Dict[str, Any],
+    prompt: str,
+    cfg: Dict[str, Any],
+    workdir: Path,
+    step_idx: int,
+) -> Tuple[str, int, int, bool]:
+    """Run one Conductor worker step as a mini-SWE-agent subloop on a shared
+    workdir. Returns (final_summary_or_diff, tokens_in, tokens_out, is_local)
+    in the same shape as ``_call_worker``."""
+    ep = (worker.get("endpoint") or "openai").lower()
+    if ep == "vllm":
+        backbone, model, endpoint, is_local = (
+            "local", worker["model"], worker.get("base_url"), True,
+        )
+    elif ep == "anthropic":
+        backbone, model, endpoint, is_local = (
+            "cloud", worker["model"], None, False,
+        )
+    else:
+        # OpenAI workers (gpt-5-mini etc.) aren't supported as agent-loop
+        # backbones today (the loop's tool-call format is Anthropic- or
+        # OpenAI-via-vllm-shaped only). Fall back to one-shot for those —
+        # SWE-bench-wise they were already weak; this preserves behavior.
+        return _call_worker(worker, prompt, cfg)
+    out = run_swe_agent_loop(
+        task,
+        backbone=backbone,
+        backbone_model=model,
+        cloud_endpoint="anthropic" if backbone == "cloud" else "anthropic",
+        local_endpoint=endpoint,
+        initial_prompt=prompt,
+        max_turns=int(cfg.get("swe_max_turns", 30)),
+        bash_timeout=int(cfg.get("swe_bash_timeout_s", 120)),
+        output_cap=int(cfg.get("swe_output_cap", 10_000)),
+        turn_max_tokens=int(cfg.get("swe_turn_max_tokens", 4096)),
+        trace_prefix=f"conductor_step{step_idx}",
+        workdir=workdir,
+    )
+    return out["final_summary"] or out["answer"], out["tokens_in"], out["tokens_out"], is_local
+
+
 @AgentRegistry.register("conductor")
 class ConductorAgent(LocalCloudAgent):
     """Plan-then-execute static DAG over a worker pool. See module docstring."""
@@ -346,45 +398,92 @@ class ConductorAgent(LocalCloudAgent):
         })
 
         # 2. Execute
+        # If we're on a SWE-bench task AND cfg["swe_use_agent_loop"] is on,
+        # every worker step runs through run_swe_agent_loop on a SHARED
+        # workdir so step N+1 builds on step N's edits. The final patch is
+        # whatever `git diff` produces after the last step.
+        task_meta = (context.metadata.get("task") if context is not None else {}) or {}
+        swe_mode = (
+            bool(cfg.get("swe_use_agent_loop"))
+            and bool(task_meta.get("problem_statement"))
+            and bool(task_meta.get("repo"))
+            and bool(task_meta.get("base_commit"))
+        )
         steps: List[Dict[str, Any]] = []
         tokens_local = 0
         tokens_cloud = 0
         cost = 0.0
         final_answer = ""
+        shared_workdir: Optional[Path] = None
 
-        for i, (mid, subtask, access) in enumerate(
-            zip(plan["model_id"], plan["subtasks"], plan["access_list"])
-        ):
-            worker = workers[mid]
-            prompt = _build_step_prompt(question, subtask, steps, access)
-            self.record_trace_event({
-                "kind": "conductor_step_dispatch",
-                "step_idx": i,
-                "worker_id": mid,
-                "worker_name": worker["name"],
-                "worker_model": worker["model"],
-                "subtask": subtask,
-                "access": access,
-                "prompt": prompt,
-            })
-            text, w_in, w_out, is_local = _call_worker(worker, prompt, cfg)
-            if is_local:
-                tokens_local += w_in + w_out
-            else:
-                tokens_cloud += w_in + w_out
-                cost += self.cost_usd(worker["model"], w_in, w_out)
-            steps.append({
-                "step_idx": i,
-                "model_id": mid,
-                "worker_name": worker["name"],
-                "worker_model": worker["model"],
-                "subtask": subtask,
-                "access": access,
-                "output": text,
-                "tokens_in": w_in,
-                "tokens_out": w_out,
-            })
-            final_answer = text
+        try:
+            if swe_mode:
+                shared_workdir = Path(tempfile.mkdtemp(
+                    prefix=f"conductor-swe-{task_meta.get('task_id','x')}-"
+                ))
+                _clone_repo(task_meta["repo"], task_meta["base_commit"], shared_workdir)
+                self.record_trace_event({
+                    "kind": "conductor_swe_workdir",
+                    "workdir": str(shared_workdir),
+                    "repo": task_meta["repo"],
+                    "base_commit": task_meta["base_commit"],
+                })
+
+            for i, (mid, subtask, access) in enumerate(
+                zip(plan["model_id"], plan["subtasks"], plan["access_list"])
+            ):
+                worker = workers[mid]
+                prompt = _build_step_prompt(question, subtask, steps, access)
+                self.record_trace_event({
+                    "kind": "conductor_step_dispatch",
+                    "step_idx": i,
+                    "worker_id": mid,
+                    "worker_name": worker["name"],
+                    "worker_model": worker["model"],
+                    "subtask": subtask,
+                    "access": access,
+                    "prompt": prompt,
+                    "swe_mode": swe_mode,
+                })
+
+                if swe_mode:
+                    text, w_in, w_out, is_local = _swe_worker_step(
+                        worker, task_meta, prompt, cfg, shared_workdir, i,
+                    )
+                else:
+                    text, w_in, w_out, is_local = _call_worker(worker, prompt, cfg)
+
+                if is_local:
+                    tokens_local += w_in + w_out
+                else:
+                    tokens_cloud += w_in + w_out
+                    cost += self.cost_usd(worker["model"], w_in, w_out)
+                steps.append({
+                    "step_idx": i,
+                    "model_id": mid,
+                    "worker_name": worker["name"],
+                    "worker_model": worker["model"],
+                    "subtask": subtask,
+                    "access": access,
+                    "output": text,
+                    "tokens_in": w_in,
+                    "tokens_out": w_out,
+                })
+                final_answer = text
+
+            # For SWE mode, the authoritative patch is whatever lives in
+            # the working tree at the end — replace whatever the last
+            # worker emitted with the full diff (so scoring picks it up).
+            if swe_mode and shared_workdir is not None:
+                patch = _extract_diff(shared_workdir)
+                if patch.strip():
+                    final_answer = (
+                        f"{final_answer}\n\n```diff\n{patch}```"
+                        if final_answer else f"```diff\n{patch}```"
+                    )
+        finally:
+            if shared_workdir is not None:
+                shutil.rmtree(shared_workdir, ignore_errors=True)
 
         # Conductor (planner) cost goes into cloud bucket
         cost += self.cost_usd(self._cloud_model, conductor_p_in, conductor_p_out)
