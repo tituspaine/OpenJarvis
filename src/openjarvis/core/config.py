@@ -943,10 +943,6 @@ class AnalyticsConfig:
 
     No chat content, prompts, model outputs, file paths, emails, IPs,
     or hardware identifiers are ever sent. See ``docs/telemetry.md``.
-
-    Opt out via any of:
-      - ``jarvis analytics disable``
-      - ``[analytics] enabled = false`` in config.toml
     """
 
     enabled: bool = True
