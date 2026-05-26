@@ -192,10 +192,9 @@ def _process_cell(cell_dir: Path) -> Dict[str, Any]:
             else:
                 with rows_lock:
                     old_score = rows[i].get("score") or {}
-                    old_ok = bool(isinstance(old_score, dict) and old_score.get("success"))
                     new_reason = ((new_score.get("details") or {}).get("reason")
                                   if isinstance(new_score.get("details"), dict) else None)
-                    if old_ok and not new_score["success"] and new_reason == "no_report":
+                    if new_reason == "no_report":
                         pass
                     else:
                         rows[i]["score"] = new_score
